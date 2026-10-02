@@ -1,7 +1,9 @@
 /**
  * /leaks 泄漏处置单与复检闭环
  * 派单、填写措施、录复检浓度并闭环；状态机 待处置 → 已处置 → 已复检。
- * 消费 Leak、Device、Reading；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<AbnormalTag>。
+ * 标准值调整重算后，待处置 / 已处置的处置单退回「标准复核」并挡住复检；
+ * 已复检（合格 / 不合格）的处置单保留原结论。
+ * 消费 Leak、Device、Reading；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
 import {
@@ -12,6 +14,7 @@ import {
   Message,
   Modal,
   Popconfirm,
+  Radio,
   Select,
   Space,
   Table,
@@ -22,7 +25,7 @@ import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
-import { useLeakStore } from '@/stores/leakStore'
+import { useLeakStore, type ReviewDecision } from '@/stores/leakStore'
 import {
   EMPTY_LEAK_DRAFT,
   LEAK_RETEST_PASS_PPM,
@@ -35,6 +38,13 @@ import {
 } from '@/types/leak'
 import { deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
+const STATE_COLOR: Record<LeakState, string> = {
+  待处置: 'red',
+  已处置: 'blue',
+  标准复核: 'orange',
+  已复检: 'green'
+}
+
 export default function LeakBoard() {
   const stationStore = useStationStore()
   const leakStore = useLeakStore()
@@ -42,9 +52,11 @@ export default function LeakBoard() {
   const [form] = Form.useForm<LeakDraft>()
   const [treatForm] = Form.useForm<{ handler: string; measure: string }>()
   const [retestForm] = Form.useForm<{ retestValuePpm: number; handler: string }>()
+  const [reviewForm] = Form.useForm<{ decision: ReviewDecision; reviewer: string; note: string }>()
   const [formOpen, setFormOpen] = useState(false)
   const [treatOpen, setTreatOpen] = useState(false)
   const [retestOpen, setRetestOpen] = useState(false)
+  const [reviewOpen, setReviewOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [target, setTarget] = useState<Leak | null>(null)
   const [keyword, setKeyword] = useState('')
@@ -123,8 +135,16 @@ export default function LeakBoard() {
       await leakStore.updateLeak(editingId, values)
       Message.success('处置单已更新')
     } else {
-      await leakStore.createLeak(values)
-      Message.success('处置单已创建')
+      // 手工新建同样按「同设备同日」幂等，不会重复建单
+      const result = await leakStore.dispatchLeak({
+        deviceId: values.deviceId,
+        stationId: '',
+        concentrationPpm: values.concentrationPpm,
+        foundTime: values.foundTime,
+        measure: values.measure
+      })
+      if (values.handler) await leakStore.updateLeak(result.leak.id, { handler: values.handler })
+      Message.success(result.created ? '处置单已创建' : '该设备当日已有处置单，已打开原单（未重复生成）')
     }
     setFormOpen(false)
   }
@@ -134,9 +154,13 @@ export default function LeakBoard() {
     Message.success('处置单已删除')
   }
 
-  const advance = async (leak: Leak): Promise<void> => {
+  const advance = (leak: Leak): void => {
     const next = LEAK_STATE_FLOW[leak.state]
     if (!next) {
+      if (leak.state === '标准复核') {
+        Message.warning('标准调整后该处置单待复核，请先完成「标准复核」')
+        return
+      }
       Message.info('该处置单已完成复检闭环')
       return
     }
@@ -149,6 +173,12 @@ export default function LeakBoard() {
     setTarget(leak)
     retestForm.setFieldsValue({ retestValuePpm: leak.retestValuePpm || 0, handler: leak.handler })
     setRetestOpen(true)
+  }
+
+  const openReview = (leak: Leak): void => {
+    setTarget(leak)
+    reviewForm.setFieldsValue({ decision: '维持原结论', reviewer: '', note: '' })
+    setReviewOpen(true)
   }
 
   const submitTreat = async (): Promise<void> => {
@@ -164,6 +194,10 @@ export default function LeakBoard() {
     if (!target) return
     const values = await retestForm.validate().catch(() => null)
     if (!values) return
+    if (target.state === '标准复核') {
+      Message.warning('该处置单已退回标准复核，复核完成前不能录入复检')
+      return
+    }
     const passed = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler)
     if (passed) {
       Message.success(`复检浓度 ${values.retestValuePpm} ppm ≤ ${LEAK_RETEST_PASS_PPM} ppm，判定合格，处置单已闭环`)
@@ -173,10 +207,23 @@ export default function LeakBoard() {
     setRetestOpen(false)
   }
 
+  const submitReview = async (): Promise<void> => {
+    if (!target) return
+    const values = await reviewForm.validate().catch(() => null)
+    if (!values) return
+    await leakStore.resolveReview(target.id, values.decision, values.reviewer, values.note)
+    Message.success(
+      values.decision === '维持原结论'
+        ? '复核完成：维持原异常结论，已恢复到退回前状态，可继续处置 / 复检'
+        : '复核完成：判定为误报，处置单按已复检闭环'
+    )
+    setReviewOpen(false)
+  }
+
   const columns: TableColumnProps<Leak>[] = [
     {
       title: '调压站 / 设备',
-      width: 240,
+      width: 230,
       render: (_value, record) => {
         const station = stationStore.stations.find((item) => item.id === record.stationId)
         const device = stationStore.devices.find((item) => item.id === record.deviceId)
@@ -185,7 +232,7 @@ export default function LeakBoard() {
     },
     {
       title: '泄漏浓度',
-      width: 200,
+      width: 180,
       render: (_value, record) => (
         <Space size={6}>
           <span style={{ color: '#f53f3f', fontWeight: 600 }}>{formatLeakConcentration(record.concentrationPpm)}</span>
@@ -195,18 +242,29 @@ export default function LeakBoard() {
         </Space>
       )
     },
-    { title: '发现时间', dataIndex: 'foundTime', width: 120 },
-    { title: '处置措施', dataIndex: 'measure', width: 240, render: (value: string) => value || '—' },
+    { title: '发现时间', dataIndex: 'foundTime', width: 110 },
     {
-      title: '状态',
-      width: 110,
+      title: '处置措施 / 复核说明',
+      width: 280,
       render: (_value, record) => (
-        <Tag color={record.state === '已复检' ? 'green' : record.state === '已处置' ? 'blue' : 'red'}>{record.state}</Tag>
+        <Space direction="vertical" size={2}>
+          <span>{record.measure || '—'}</span>
+          {record.state === '标准复核' ? (
+            <Tag color="orange" size="small">
+              {record.reviewReason || '标准值调整，退回标准复核'}
+            </Tag>
+          ) : null}
+        </Space>
       )
     },
     {
+      title: '状态',
+      width: 100,
+      render: (_value, record) => <Tag color={STATE_COLOR[record.state]}>{record.state}</Tag>
+    },
+    {
       title: '复检值',
-      width: 160,
+      width: 150,
       render: (_value, record) => {
         if (record.retestValuePpm <= 0) return <span className="muted">未复检</span>
         return (
@@ -219,15 +277,25 @@ export default function LeakBoard() {
         )
       }
     },
-    { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
+    { title: '处置人', dataIndex: 'handler', width: 90, render: (value: string) => value || '—' },
     {
       title: '操作',
-      width: 240,
+      width: 210,
       render: (_value, record) => (
         <Space size={4}>
-          <Button type="text" size="small" disabled={!LEAK_STATE_FLOW[record.state]} onClick={() => advance(record)}>
-            {LEAK_STATE_FLOW[record.state] === '已处置' ? '填写措施' : LEAK_STATE_FLOW[record.state] === '已复检' ? '录入复检' : '已闭环'}
-          </Button>
+          {record.state === '标准复核' ? (
+            <Button type="text" size="small" style={{ color: '#ff7d00' }} onClick={() => openReview(record)}>
+              标准复核
+            </Button>
+          ) : (
+            <Button type="text" size="small" disabled={!LEAK_STATE_FLOW[record.state]} onClick={() => advance(record)}>
+              {LEAK_STATE_FLOW[record.state] === '已处置'
+                ? '填写措施'
+                : LEAK_STATE_FLOW[record.state] === '已复检'
+                  ? '录入复检'
+                  : '已闭环'}
+            </Button>
+          )}
           <Button type="text" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
@@ -249,7 +317,7 @@ export default function LeakBoard() {
         <div>
           <h2 className="page-head__title">泄漏处置单与复检闭环</h2>
           <p className="page-head__desc">
-            待处置 → 已处置（填写措施与处置人）→ 已复检（复检浓度 ≤ {LEAK_RETEST_PASS_PPM} ppm 判合格）。
+            待处置 → 已处置（填写措施与处置人）→ 已复检（复检浓度 ≤ {LEAK_RETEST_PASS_PPM} ppm 判合格）；标准调整后开放单退回标准复核并暂停复检。
           </p>
         </div>
         <div className="page-head__actions">
@@ -269,7 +337,7 @@ export default function LeakBoard() {
       <div className="stat-row">
         <StatBadge label="处置单总数" value={leakStore.leaks.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={stats['待处置']} suffix="张" tone="danger" />
-        <StatBadge label="已处置" value={stats['已处置']} suffix="张" tone="warning" />
+        <StatBadge label="标准复核" value={stats['标准复核']} suffix="张" tone="warning" />
         <StatBadge label="复检合格" value={leakStore.retestPassCount()} percent={leakStore.closedPercent()} suffix="张" tone="success" />
       </div>
 
@@ -280,12 +348,12 @@ export default function LeakBoard() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             处置单清单（{rows.length} / {leakStore.leaks.length}）
           </h3>
-          <span className="muted">复检不合格的处置单需继续整改并再次复检</span>
+          <span className="muted">已复检合格 / 不合格的处置单保留原结论，标准调整不再退回</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
             title="没有匹配的处置单"
-            description="可在异常分级页对浓度异常读数直接派发处置单。"
+            description="可在异常分级页对浓度异常读数直接派发处置单，重复提交不会产生新单。"
             actionText="新建处置单"
             secondaryText="重置筛选"
             onAction={openCreate}
@@ -316,7 +384,7 @@ export default function LeakBoard() {
       >
         <Form form={form} layout="vertical" initialValues={EMPTY_LEAK_DRAFT}>
           <Form.Item field="deviceId" label="泄漏设备" rules={[{ required: true, message: '请选择设备' }]}>
-            <Select options={deviceOptions} showSearch />
+            <Select options={deviceOptions} showSearch disabled={Boolean(editingId)} />
           </Form.Item>
           <Form.Item field="concentrationPpm" label="泄漏浓度(ppm)" rules={[{ required: true, message: '请填写浓度' }]}>
             <InputNumber min={0} style={{ width: '100%' }} />
@@ -330,9 +398,11 @@ export default function LeakBoard() {
           <Form.Item field="handler" label="处置人">
             <Input placeholder="如 张伟" />
           </Form.Item>
-          <Form.Item field="state" label="状态" rules={[{ required: true, message: '请选择状态' }]}>
-            <Select options={LEAK_STATES.map((item) => ({ label: item, value: item }))} />
-          </Form.Item>
+          {editingId ? (
+            <Form.Item field="state" label="状态" rules={[{ required: true, message: '请选择状态' }]}>
+              <Select options={LEAK_STATES.map((item) => ({ label: item, value: item }))} />
+            </Form.Item>
+          ) : null}
           <Form.Item field="retestValuePpm" label="复检浓度(ppm)">
             <InputNumber min={0} style={{ width: '100%' }} />
           </Form.Item>
@@ -377,6 +447,38 @@ export default function LeakBoard() {
           </Form.Item>
           <Form.Item field="handler" label="复检人" rules={[{ required: true, message: '请填写复检人' }]}>
             <Input placeholder="如 李娜" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        visible={reviewOpen}
+        title="标准复核（标准值调整后）"
+        onCancel={() => setReviewOpen(false)}
+        onOk={submitReview}
+        okText="提交复核结论"
+        cancelText="取消"
+        unmountOnExit
+      >
+        {target ? (
+          <div className="muted" style={{ marginBottom: 12 }}>
+            {target.reviewReason || '该处置单因标准值调整退回标准复核'}
+            <br />
+            原状态：{target.reviewFromState || '—'}；已复检合格的处置单不会进入此流程。
+          </div>
+        ) : null}
+        <Form form={reviewForm} layout="vertical">
+          <Form.Item field="decision" label="复核结论" rules={[{ required: true, message: '请选择复核结论' }]}>
+            <Radio.Group direction="vertical">
+              <Radio value="维持原结论">维持原异常结论（恢复到退回前状态，可继续处置 / 复检）</Radio>
+              <Radio value="误报关闭">新标准下不再异常，判定为误报并闭环</Radio>
+            </Radio.Group>
+          </Form.Item>
+          <Form.Item field="reviewer" label="复核人" rules={[{ required: true, message: '请填写复核人' }]}>
+            <Input placeholder="如 接班班长 王强" />
+          </Form.Item>
+          <Form.Item field="note" label="复核说明">
+            <Input.TextArea placeholder="如 已按 2024-06-15 新标准复测，读数仍超标，维持原单" autoSize={{ minRows: 2, maxRows: 4 }} />
           </Form.Item>
         </Form>
       </Modal>

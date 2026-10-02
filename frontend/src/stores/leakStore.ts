@@ -1,17 +1,26 @@
 /**
  * 泄漏处置状态（Zustand）
  * 维护处置单状态机、复检值与闭环统计。
+ * 关键规则：
+ * - 派单按 dispatchKey 幂等：重复提交（含批量确认）不会多出泄漏单
+ * - 标准值调整重算后，待处置 / 已处置的处置单退回「标准复核」并挡住复检
+ * - 已复检的处置单（合格 / 不合格结论）保留原结论，不参与退回
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
 import { createId, db, type LeakRow } from '@/utils/db'
 import {
   LEAK_RETEST_PASS_PPM,
+  manualDispatchKey,
+  readingDispatchKey,
   retestPassed,
   type Leak,
   type LeakDraft,
   type LeakState
 } from '@/types/leak'
+
+/** 标准复核的两种处置结论 */
+export type ReviewDecision = '维持原结论' | '误报关闭'
 
 interface LeakState_ {
   leaks: Leak[]
@@ -22,18 +31,30 @@ interface LeakState_ {
   patchFilter: (patch: { stateFilter?: LeakState[]; stationId?: string; onlyOpen?: boolean }) => void
   resetFilter: () => void
   createLeak: (draft: LeakDraft) => Promise<Leak>
-  updateLeak: (id: string, patch: Partial<LeakDraft>) => Promise<void>
-  removeLeak: (id: string) => Promise<void>
-  advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakState | null>
-  submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean>
-  hasLeakOfDevice: (deviceId: string) => boolean
-  createFromAbnormal: (payload: {
+  /** 幂等派单：命中已有 dispatchKey 直接返回原单（created=false），不产生新单 */
+  dispatchLeak: (input: {
     deviceId: string
     stationId: string
     concentrationPpm: number
     foundTime: string
     measure: string
-  }) => Promise<Leak>
+    sourceReadingId?: string
+  }) => Promise<{ leak: Leak; created: boolean }>
+  updateLeak: (id: string, patch: Partial<LeakDraft>) => Promise<void>
+  removeLeak: (id: string) => Promise<void>
+  advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakState | null>
+  submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean>
+  /** 标准复核：维持原结论 → 恢复退回前状态；误报关闭 → 已复检闭环 */
+  resolveReview: (id: string, decision: ReviewDecision, reviewer: string, note: string) => Promise<void>
+  hasLeakOfDevice: (deviceId: string) => boolean
+  createFromAbnormal: (payload: {
+    readingId: string
+    deviceId: string
+    stationId: string
+    concentrationPpm: number
+    foundTime: string
+    measure: string
+  }) => Promise<{ leak: Leak; created: boolean }>
   counts: () => Record<LeakState, number>
   closedPercent: () => number
   retestPassCount: () => number
@@ -72,11 +93,56 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       state: draft.state,
       retestValuePpm: Number(draft.retestValuePpm) || 0,
       handler: draft.handler.trim(),
+      dispatchKey: manualDispatchKey(draft.deviceId, draft.foundTime),
+      sourceReadingId: '',
+      reviewFromState: '',
+      reviewReason: '',
       createdAt: now,
       updatedAt: now
     }
     await db.leaks.put(row)
     return row
+  },
+
+  async dispatchLeak(input) {
+    const key = input.sourceReadingId
+      ? readingDispatchKey(input.sourceReadingId)
+      : manualDispatchKey(input.deviceId, input.foundTime)
+    // 派发幂等：直接查库，避免 store 订阅回流延迟导致重复提交；命中则返回原单
+    const existingInDb = await db.leaks.where('dispatchKey').equals(key).first()
+    if (existingInDb) return { leak: existingInDb, created: false }
+    const device = await db.devices.get(input.deviceId)
+    const now = Date.now()
+    const row: LeakRow = {
+      id: createId('lk'),
+      deviceId: input.deviceId,
+      stationId: input.stationId || (device ? device.stationId : ''),
+      concentrationPpm: Number(input.concentrationPpm) || 0,
+      foundTime: input.foundTime,
+      measure: input.measure.trim(),
+      state: '待处置',
+      retestValuePpm: 0,
+      handler: '',
+      dispatchKey: key,
+      sourceReadingId: input.sourceReadingId ?? '',
+      reviewFromState: '',
+      reviewReason: '',
+      createdAt: now,
+      updatedAt: now
+    }
+    try {
+      // dispatchKey 为唯一索引：并发双击时数据库原子约束只会放行一张
+      await db.leaks.add(row)
+      return { leak: row, created: true }
+    } catch (error) {
+      const name = (error as { name?: string })?.name
+      if (name === 'ConstraintError') {
+        const winner = await db.leaks.where('dispatchKey').equals(key).first()
+        if (winner) return { leak: winner, created: false }
+        throw error
+      }
+      throw error
+    }
   },
 
   async updateLeak(id, patch) {
@@ -103,14 +169,42 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   },
 
   async submitRetest(id, retestValuePpm, handler) {
+    const leak = await db.leaks.get(id)
+    // 标准复核态挡住复检：必须先完成标准复核
+    if (!leak || leak.state === '标准复核') return false
     const value = Number(retestValuePpm) || 0
     await db.leaks.update(id, {
       state: '已复检',
       retestValuePpm: value,
       handler: handler.trim() || '未署名',
+      reviewFromState: '',
       updatedAt: Date.now()
     })
     return retestPassed(value)
+  },
+
+  async resolveReview(id, decision, reviewer, note) {
+    // 直接查库，避免 store 订阅回流延迟
+    const leak = await db.leaks.get(id)
+    if (!leak || leak.state !== '标准复核') return
+    const now = Date.now()
+    const reviewNote = `标准复核（${reviewer.trim() || '未署名'}）：${decision}${note.trim() ? `；${note.trim()}` : ''}`
+    if (decision === '误报关闭') {
+      await db.leaks.update(id, {
+        state: '已复检',
+        reviewFromState: '',
+        retestValuePpm: leak.retestValuePpm,
+        measure: leak.measure ? `${leak.measure}\n${reviewNote}` : reviewNote,
+        updatedAt: now
+      })
+      return
+    }
+    await db.leaks.update(id, {
+      state: leak.reviewFromState === '已处置' ? '已处置' : '待处置',
+      reviewFromState: '',
+      measure: leak.measure ? `${leak.measure}\n${reviewNote}` : reviewNote,
+      updatedAt: now
+    })
   },
 
   hasLeakOfDevice(deviceId) {
@@ -118,19 +212,18 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   },
 
   async createFromAbnormal(payload) {
-    return get().createLeak({
+    return get().dispatchLeak({
       deviceId: payload.deviceId,
+      stationId: payload.stationId,
       concentrationPpm: payload.concentrationPpm,
       foundTime: payload.foundTime,
       measure: payload.measure,
-      state: '待处置',
-      retestValuePpm: 0,
-      handler: ''
+      sourceReadingId: payload.readingId
     })
   },
 
   counts() {
-    const counts: Record<LeakState, number> = { 待处置: 0, 已处置: 0, 已复检: 0 }
+    const counts: Record<LeakState, number> = { 待处置: 0, 已处置: 0, 标准复核: 0, 已复检: 0 }
     get().leaks.forEach((leak) => {
       counts[leak.state] += 1
     })

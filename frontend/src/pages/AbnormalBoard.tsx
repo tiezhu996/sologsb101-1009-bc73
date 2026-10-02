@@ -78,21 +78,20 @@ export default function AbnormalBoard() {
       const foundTime = row.patrol
         ? row.patrol.patrolDate || row.patrol.planDate
         : new Date().toISOString().slice(0, 10)
-      if (leakStore.leaks.some((leak) => leak.deviceId === point.deviceId && leak.foundTime === foundTime)) {
-        Message.info('该设备当日已派发过处置单')
-        return
-      }
       const station = stationStore.stations.find((item) => item.id === point.stationId)
-      await leakStore.createFromAbnormal({
+      // 派单按异常读数 id 幂等：重复点击 / 批量重复提交不会多出泄漏单
+      const { created } = await leakStore.createFromAbnormal({
+        readingId: row.reading.id,
         deviceId: point.deviceId,
         stationId: point.stationId,
         concentrationPpm: row.reading.value,
         foundTime,
-        measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
+        measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，按 ${row.reading.judgeEffectiveDate || '当日'} 生效标准偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
           station ? station.name : ''
         } 已派发处置单`
       })
-      Message.success('已派发泄漏处置单')
+      if (created) Message.success('已派发泄漏处置单')
+      else Message.info('该异常读数已派发过处置单，未重复生成')
       return
     }
     await patrolStore.saveSingleReading(row.reading.patrolId, point, row.reading.value, '异常已确认并记录')
@@ -104,26 +103,31 @@ export default function AbnormalBoard() {
       Message.warning('请先勾选需要确认的异常读数')
       return
     }
-    let leakCount = 0
+    let leakCreated = 0
+    let leakSkipped = 0
     let notedCount = 0
     for (const key of selectedKeys) {
       const row = rows.find((item) => item.reading.id === key)
       if (!row || !row.point) continue
       if (row.point.unit === 'ppm') {
-        await leakStore.createFromAbnormal({
+        const result = await leakStore.createFromAbnormal({
+          readingId: row.reading.id,
           deviceId: row.point.deviceId,
           stationId: row.point.stationId,
           concentrationPpm: row.reading.value,
           foundTime: row.patrol ? row.patrol.patrolDate || row.patrol.planDate : new Date().toISOString().slice(0, 10),
-          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`
+          measure: `${row.point.name} 实测 ${row.reading.value} ppm，按 ${row.reading.judgeEffectiveDate || '当日'} 生效标准批量派单`
         })
-        leakCount += 1
+        if (result.created) leakCreated += 1
+        else leakSkipped += 1
       } else {
         await patrolStore.saveSingleReading(row.reading.patrolId, row.point, row.reading.value, '异常已批量确认')
         notedCount += 1
       }
     }
-    Message.success(`批量确认完成：派发处置单 ${leakCount} 张，记录确认 ${notedCount} 条`)
+    Message.success(
+      `批量确认完成：新派处置单 ${leakCreated} 张，重复跳过 ${leakSkipped} 张，记录确认 ${notedCount} 条`
+    )
     setSelectedKeys([])
   }
 
@@ -174,10 +178,14 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '判定时标准（追溯）',
+      width: 210,
       render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+        record.point
+          ? `${record.reading.judgeStandardMin} ~ ${record.reading.judgeStandardMax} ${record.point.unit}（${
+              record.reading.judgeEffectiveDate || '—'
+            } 生效）`
+          : '—'
     },
     {
       title: '读数',
@@ -212,25 +220,36 @@ export default function AbnormalBoard() {
     },
     {
       title: '操作',
-      width: 280,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="text" size="small" onClick={() => confirm(record)}>
-            {record.point?.unit === 'ppm' ? '派发处置单' : '确认异常'}
-          </Button>
-          <Button type="text" size="small" onClick={() => openFix(record)}>
-            修正读数
-          </Button>
-          <Popconfirm title="确认删除该条误录读数？" onOk={() => removeReading(record)}>
-            <Button type="text" size="small" status="danger">
-              删除
+      width: 300,
+      render: (_value, record) => {
+        const isPpm = record.point?.unit === 'ppm'
+        const dispatched = isPpm
+          ? leakStore.leaks.some((leak) => leak.sourceReadingId === record.reading.id)
+          : false
+        return (
+          <Space size={4}>
+            <Button
+              type="text"
+              size="small"
+              disabled={dispatched}
+              onClick={() => confirm(record)}
+            >
+              {isPpm ? (dispatched ? '已派发处置单' : '派发处置单') : '确认异常'}
             </Button>
-          </Popconfirm>
-          <Button type="text" size="small" onClick={() => navigate('/leaks')}>
-            处置台账
-          </Button>
-        </Space>
-      )
+            <Button type="text" size="small" onClick={() => openFix(record)}>
+              修正读数
+            </Button>
+            <Popconfirm title="确认删除该条误录读数？" onOk={() => removeReading(record)}>
+              <Button type="text" size="small" status="danger">
+                删除
+              </Button>
+            </Popconfirm>
+            <Button type="text" size="small" onClick={() => navigate('/leaks')}>
+              处置台账
+            </Button>
+          </Space>
+        )
+      }
     }
   ]
 

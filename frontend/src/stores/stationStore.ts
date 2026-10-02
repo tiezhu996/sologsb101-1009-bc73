@@ -7,19 +7,19 @@ import { create } from 'zustand'
 import { liveQuery } from 'dexie'
 import {
   createId,
+  createInitialStandardVersion,
   db,
   deleteDeviceCascade,
   deletePointCascade,
   deleteStationCascade,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
   type DeviceRow,
   type PointRow,
   type StationRow
 } from '@/utils/db'
 import type { Device, DeviceDraft, DeviceState, DeviceType } from '@/types/device'
-import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft } from '@/types/point'
+import type { Point, PointDraft, PointFilterState, PointTemplate } from '@/types/point'
 import { createEmptyPointFilter } from '@/types/point'
 import type { Station, StationDraft, StationGrade } from '@/types/station'
 
@@ -40,8 +40,6 @@ interface StationState {
   currentStationId: string | null
   filter: StationFilterState
   pointFilter: PointFilterState
-  /** 标准值编辑草稿：点位 id → 待提交的上下限 */
-  standardDraft: Record<string, StandardDraft>
   ready: boolean
   selectStation: (id: string | null) => void
   patchFilter: (patch: Partial<StationFilterState>) => void
@@ -58,10 +56,6 @@ interface StationState {
   updatePoint: (id: string, patch: Partial<PointDraft>) => Promise<void>
   removePoint: (id: string) => Promise<void>
   applyTemplate: (deviceId: string, templates: PointTemplate[]) => Promise<number>
-  setStandardDraft: (pointId: string, draft: StandardDraft) => void
-  clearStandardDraft: (pointId?: string) => void
-  commitStandardDraft: (pointId: string) => Promise<void>
-  commitAllStandardDrafts: () => Promise<number>
   devicesOfStation: (stationId: string) => Device[]
   pointsOfDevice: (deviceId: string) => Point[]
   currentStation: () => Station | null
@@ -76,7 +70,6 @@ export const useStationStore = create<StationState>((set, get) => ({
   currentStationId: readUiPrefs().lastStationId,
   filter: createEmptyStationFilter(),
   pointFilter: createEmptyPointFilter(),
-  standardDraft: {},
   ready: false,
 
   selectStation(id) {
@@ -164,19 +157,31 @@ export const useStationStore = create<StationState>((set, get) => ({
   async createPoint(draft) {
     const now = Date.now()
     const device = await db.devices.get(draft.deviceId)
+    const min = Math.min(Number(draft.standardMin), Number(draft.standardMax))
+    const max = Math.max(Number(draft.standardMin), Number(draft.standardMax))
     const row: PointRow = {
       id: createId('pt'),
       deviceId: draft.deviceId,
       stationId: device ? device.stationId : '',
       name: draft.name.trim(),
-      standardMin: Number(draft.standardMin) || 0,
-      standardMax: Number(draft.standardMax) || 0,
+      standardMin: min,
+      standardMax: max > min ? max : min + 0.001,
       unit: draft.unit,
       isCritical: draft.isCritical,
       createdAt: now,
       updatedAt: now
     }
     await db.points.put(row)
+    // 新建点位即生成初始标准值版本（生效日为今天），新读数与历史版本追溯均以此版本为准
+    await createInitialStandardVersion({
+      id: row.id,
+      stationId: row.stationId,
+      standardMin: row.standardMin,
+      standardMax: row.standardMax,
+      isCritical: row.isCritical,
+      unit: row.unit,
+      createdAt: now
+    })
     return row
   },
 
@@ -187,13 +192,15 @@ export const useStationStore = create<StationState>((set, get) => ({
       const device = await db.devices.get(patch.deviceId)
       if (device) next.stationId = device.stationId
     }
+    // 上下限 / 关键点属于标准值，只能走「班组交接调整 → 新版本」，编辑弹窗不允许直接覆盖
+    delete next.standardMin
+    delete next.standardMax
+    delete next.isCritical
     await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
   },
 
   async removePoint(id) {
     await deletePointCascade(id)
-    get().clearStandardDraft(id)
   },
 
   async applyTemplate(deviceId, templates) {
@@ -215,60 +222,20 @@ export const useStationStore = create<StationState>((set, get) => ({
         createdAt: now,
         updatedAt: now
       }))
-    if (rows.length > 0) await db.points.bulkPut(rows)
-    return rows.length
-  },
-
-  setStandardDraft(pointId, draft) {
-    set({ standardDraft: { ...get().standardDraft, [pointId]: draft } })
-  },
-
-  clearStandardDraft(pointId) {
-    if (pointId === undefined) {
-      set({ standardDraft: {} })
-      return
-    }
-    const next = { ...get().standardDraft }
-    delete next[pointId]
-    set({ standardDraft: next })
-  },
-
-  async commitStandardDraft(pointId) {
-    const draft = get().standardDraft[pointId]
-    if (!draft) return
-    const min = Math.min(draft.standardMin, draft.standardMax)
-    const max = Math.max(draft.standardMin, draft.standardMax)
-    await db.points.update(pointId, {
-      standardMin: min,
-      standardMax: max > min ? max : min + 0.001,
-      isCritical: draft.isCritical,
-      updatedAt: Date.now()
-    })
-    get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
-  },
-
-  async commitAllStandardDrafts() {
-    const entries = Object.entries(get().standardDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().standardDraft[point.id]
-        const min = Math.min(draft.standardMin, draft.standardMax)
-        const max = Math.max(draft.standardMin, draft.standardMax)
-        return {
-          ...point,
-          standardMin: min,
-          standardMax: max > min ? max : min + 0.001,
-          isCritical: draft.isCritical,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
-    get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
+    if (rows.length > 0) {
+      await db.points.bulkPut(rows)
+      // 模板复制的点位同样写入初始版本
+      for (const row of rows) {
+        await createInitialStandardVersion({
+          id: row.id,
+          stationId: row.stationId,
+          standardMin: row.standardMin,
+          standardMax: row.standardMax,
+          isCritical: row.isCritical,
+          unit: row.unit,
+          createdAt: now
+        })
+      }
     }
     return rows.length
   },

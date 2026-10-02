@@ -4,13 +4,14 @@
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, deletePatrolCascade, putReading, type PatrolRow, type ReadingRow } from '@/utils/db'
+import { createId, db, deletePatrolCascade, putReading, type PatrolRow } from '@/utils/db'
 import type { Patrol, PatrolDraft, PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
 import type { ReadingDraftMap } from '@/types/reading'
 import type { AbnormalLevel, ReadingJudgement } from '@/utils/range'
 import { abnormalLevelOf, abnormalWeight, judgeReading } from '@/utils/range'
+import { useStandardStore } from '@/stores/standardStore'
 import { useStationStore } from '@/stores/stationStore'
 
 export interface AbnormalRow {
@@ -173,27 +174,25 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     const draft = get().readingDraft
     const existing = get().readings.filter((reading) => reading.patrolId === patrolId)
     const now = Date.now()
-    const payload: ReadingRow[] = []
-    points.forEach((point) => {
+    let saved = 0
+    for (const point of points) {
       const key = `${patrolId}:${point.id}`
       const value = draft[key]
-      if (value === undefined || !Number.isFinite(value)) return
+      if (value === undefined || !Number.isFinite(value)) continue
       const found = existing.find((reading) => reading.pointId === point.id)
-      const judgement = judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
-      payload.push({
+      // 统一走 putReading：新读数按最新版本判定并落判定快照
+      await putReading({
         id: found ? found.id : createId('rd'),
         patrolId,
         pointId: point.id,
         value,
-        isAbnormal: judgement.isAbnormal,
-        deviationPct: judgement.deviationPct,
         note: found ? found.note : '',
         createdAt: found ? found.createdAt : now,
         updatedAt: now
       })
-    })
-    if (payload.length > 0) await db.readings.bulkPut(payload)
-    return payload.length
+      saved += 1
+    }
+    return saved
   },
 
   async saveSingleReading(patrolId, point, value, note) {
@@ -215,6 +214,9 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   },
 
   judge(point, value) {
+    // 录入中的草稿按最新版本判定（新读数用最新值）
+    const standard = useStandardStore.getState().standardOn(point.id, '')
+    if (standard) return judgeReading(value, standard.standardMin, standard.standardMax, standard.isCritical)
     return judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
   },
 
@@ -229,15 +231,15 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       .map((reading) => {
         const point = points.find((item) => item.id === reading.pointId) ?? null
         const patrol = get().patrols.find((item) => item.id === reading.patrolId) ?? null
-        const level: AbnormalLevel = point
-          ? abnormalLevelOf(reading.deviationPct, point.isCritical)
-          : '轻微超标'
+        // 历史异常的级别与权重按「当时判定快照」追溯，不随标准值新版本翻转
+        const critical = reading.judgeIsCritical
+        const level: AbnormalLevel = abnormalLevelOf(reading.deviationPct, critical)
         return {
           reading,
           patrol,
           point,
           level,
-          weight: point ? abnormalWeight(level, point.isCritical) : 20
+          weight: abnormalWeight(level, critical)
         }
       })
       .sort((a, b) => b.weight - a.weight || b.reading.deviationPct - a.reading.deviationPct)

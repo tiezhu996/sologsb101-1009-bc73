@@ -7,6 +7,7 @@ import { ROUTES } from './router'
 import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
+import { useStandardStore } from './stores/standardStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
 
 export default function App() {
@@ -15,16 +16,20 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const standardStore = useStandardStore()
+  const standardVersions = standardStore.versions
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
 
+  const openLeakCount = leakStore.counts()['待处置'] + leakStore.counts()['标准复核']
+
   const navItems = [
     { path: ROUTES.stations, label: '调压站台账', count: stationStore.stations.length },
-    { path: ROUTES.points, label: '点位配置', count: stationStore.points.length },
+    { path: ROUTES.points, label: '点位配置', count: standardVersions.length },
     { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
-    { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
+    { path: ROUTES.leaks, label: '泄漏处置', count: openLeakCount },
     { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
   ]
 
@@ -79,7 +84,7 @@ export default function App() {
             )}
           </Space>
           <Space size={8} wrap>
-            <Badge count={leakStore.counts()['待处置']} dotStyle={{ background: '#f53f3f' }} />
+            <Badge count={openLeakCount} dotStyle={{ background: '#f53f3f' }} />
             <Button size="small" onClick={() => navigate(ROUTES.stations)}>
               调压站台账
             </Button>

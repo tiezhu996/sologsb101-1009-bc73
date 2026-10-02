@@ -6,7 +6,7 @@ import zhCN from '@arco-design/web-react/es/locale/zh-CN'
 import '@arco-design/web-react/dist/css/arco.css'
 import './styles/main.css'
 import { appRoutes } from './router'
-import { initDatabase, stampDbVersion } from './utils/db'
+import { initDatabase, resumeInterruptedBatches, stampDbVersion } from './utils/db'
 
 const container = document.getElementById('root')
 if (!container) {
@@ -19,6 +19,8 @@ stampDbVersion()
 
 // 首屏先完成 IndexedDB 打开与演示数据播种，再渲染应用，避免列表页空窗
 void initDatabase()
+  // 打开后自动续跑上次未完成（或部分失败）的标准调整重算批次，恢复进度
+  .then(() => resumeInterruptedBatches({ includeFailed: true }))
   .catch((error: unknown) => {
     console.error('本地数据库初始化失败', error)
   })
