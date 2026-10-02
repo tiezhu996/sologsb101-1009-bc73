@@ -1,6 +1,7 @@
 /**
  * 站点、设备与点位状态（Zustand）
  * 维护站点/设备/点位列表、当前选中站点与筛选条件（点位作为设备的标准值档案一并维护）。
+ * 标准值调整不直接覆盖：提交即生成带生效日期的版本与重算批次（见 utils/recalc）。
  * 数据通过模块级 liveQuery 订阅 Dexie，写入后自动回流。
  */
 import { create } from 'zustand'
@@ -12,12 +13,15 @@ import {
   deletePointCascade,
   deleteStationCascade,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
+  ROW_REVISION,
   type DeviceRow,
   type PointRow,
+  type StandardVersionRow,
   type StationRow
 } from '@/utils/db'
+import { standardVersionId, INITIAL_VERSION_DATE } from '@/types/standardVersion'
+import { submitStandardAdjustments, type StandardAdjustInput } from '@/utils/recalc'
 import type { Device, DeviceDraft, DeviceState, DeviceType } from '@/types/device'
 import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft } from '@/types/point'
 import { createEmptyPointFilter } from '@/types/point'
@@ -33,6 +37,10 @@ export function createEmptyStationFilter(): StationFilterState {
   return { keyword: '', grades: [], deviceTypes: [] }
 }
 
+function todayText(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
 interface StationState {
   stations: Station[]
   devices: Device[]
@@ -42,12 +50,15 @@ interface StationState {
   pointFilter: PointFilterState
   /** 标准值编辑草稿：点位 id → 待提交的上下限 */
   standardDraft: Record<string, StandardDraft>
+  /** 标准值调整统一生效日期（历史读数按巡检日期取版本，新读数取最新版本） */
+  adjustDate: string
   ready: boolean
   selectStation: (id: string | null) => void
   patchFilter: (patch: Partial<StationFilterState>) => void
   resetFilter: () => void
   patchPointFilter: (patch: Partial<PointFilterState>) => void
   resetPointFilter: () => void
+  setAdjustDate: (date: string) => void
   createStation: (draft: StationDraft) => Promise<Station>
   updateStation: (id: string, patch: Partial<StationDraft>) => Promise<void>
   removeStation: (id: string) => Promise<void>
@@ -60,8 +71,9 @@ interface StationState {
   applyTemplate: (deviceId: string, templates: PointTemplate[]) => Promise<number>
   setStandardDraft: (pointId: string, draft: StandardDraft) => void
   clearStandardDraft: (pointId?: string) => void
-  commitStandardDraft: (pointId: string) => Promise<void>
+  commitStandardDraft: (pointId: string) => Promise<boolean>
   commitAllStandardDrafts: () => Promise<number>
+  buildAdjustments: () => StandardAdjustInput[]
   devicesOfStation: (stationId: string) => Device[]
   pointsOfDevice: (deviceId: string) => Point[]
   currentStation: () => Station | null
@@ -77,6 +89,7 @@ export const useStationStore = create<StationState>((set, get) => ({
   filter: createEmptyStationFilter(),
   pointFilter: createEmptyPointFilter(),
   standardDraft: {},
+  adjustDate: todayText(),
   ready: false,
 
   selectStation(id) {
@@ -98,6 +111,10 @@ export const useStationStore = create<StationState>((set, get) => ({
 
   resetPointFilter() {
     set({ pointFilter: createEmptyPointFilter() })
+  },
+
+  setAdjustDate(date) {
+    set({ adjustDate: date })
   },
 
   async createStation(draft) {
@@ -164,31 +181,83 @@ export const useStationStore = create<StationState>((set, get) => ({
   async createPoint(draft) {
     const now = Date.now()
     const device = await db.devices.get(draft.deviceId)
+    const min = Math.min(Number(draft.standardMin) || 0, Number(draft.standardMax) || 0)
+    const maxInput = Math.max(Number(draft.standardMin) || 0, Number(draft.standardMax) || 0)
+    const max = maxInput > min ? maxInput : min + 0.001
+    const pointId = createId('pt')
     const row: PointRow = {
-      id: createId('pt'),
+      id: pointId,
       deviceId: draft.deviceId,
       stationId: device ? device.stationId : '',
       name: draft.name.trim(),
-      standardMin: Number(draft.standardMin) || 0,
-      standardMax: Number(draft.standardMax) || 0,
+      standardMin: min,
+      standardMax: max,
       unit: draft.unit,
       isCritical: draft.isCritical,
       createdAt: now,
       updatedAt: now
     }
-    await db.points.put(row)
+    // 新建点位自带一条初始版本（生效日期取今天；新点位无历史读数）
+    const initialVersion: StandardVersionRow = {
+      id: standardVersionId(pointId, INITIAL_VERSION_DATE),
+      versionNo: 1,
+      pointId,
+      deviceId: draft.deviceId,
+      stationId: device ? device.stationId : '',
+      effectiveDate: INITIAL_VERSION_DATE,
+      standardMin: min,
+      standardMax: max,
+      unit: draft.unit,
+      isCritical: draft.isCritical,
+      source: 'initial',
+      recalcBatchId: '',
+      note: '新建点位初始版本',
+      createdAt: now,
+      updatedAt: now,
+      revision: ROW_REVISION
+    }
+    await db.transaction('rw', [db.points, db.standardVersions], async () => {
+      await db.points.put(row)
+      await db.standardVersions.put(initialVersion)
+    })
     return row
   },
 
   async updatePoint(id, patch) {
-    const next: Partial<PointRow> = { ...patch, updatedAt: Date.now() }
-    if (patch.name !== undefined) next.name = patch.name.trim()
-    if (patch.deviceId !== undefined) {
-      const device = await db.devices.get(patch.deviceId)
-      if (device) next.stationId = device.stationId
+    const current = await db.points.get(id)
+    // 非标准字段（名称/设备/单位）直接改点位档案
+    const metaPatch: Partial<PointRow> = { updatedAt: Date.now() }
+    let touchedMeta = false
+    if (patch.name !== undefined) {
+      metaPatch.name = patch.name.trim()
+      touchedMeta = true
     }
-    await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
+    if (patch.deviceId !== undefined) {
+      metaPatch.deviceId = patch.deviceId
+      const device = await db.devices.get(patch.deviceId)
+      if (device) metaPatch.stationId = device.stationId
+      touchedMeta = true
+    }
+    if (patch.unit !== undefined) {
+      metaPatch.unit = patch.unit
+      touchedMeta = true
+    }
+    if (touchedMeta) await db.points.update(id, metaPatch)
+
+    // 标准字段（上下限/关键点）不覆盖：走版本 + 重算批次
+    const standardChanged =
+      patch.standardMin !== undefined || patch.standardMax !== undefined || patch.isCritical !== undefined
+    if (standardChanged && current) {
+      await submitStandardAdjustments([
+        {
+          pointId: id,
+          effectiveDate: get().adjustDate,
+          standardMin: patch.standardMin ?? current.standardMin,
+          standardMax: patch.standardMax ?? current.standardMax,
+          isCritical: patch.isCritical ?? current.isCritical
+        }
+      ])
+    }
   },
 
   async removePoint(id) {
@@ -201,21 +270,49 @@ export const useStationStore = create<StationState>((set, get) => ({
     const stationId = device ? device.stationId : ''
     const existing = get().points.filter((point) => point.deviceId === deviceId).map((point) => point.name)
     const now = Date.now()
-    const rows: PointRow[] = templates
+    const rows: PointRow[] = []
+    const versions: StandardVersionRow[] = []
+    templates
       .filter((template) => !existing.includes(template.name))
-      .map((template) => ({
-        id: createId('pt'),
-        deviceId,
-        stationId,
-        name: template.name,
-        standardMin: template.standardMin,
-        standardMax: template.standardMax,
-        unit: template.unit,
-        isCritical: template.isCritical,
-        createdAt: now,
-        updatedAt: now
-      }))
-    if (rows.length > 0) await db.points.bulkPut(rows)
+      .forEach((template) => {
+        const pointId = createId('pt')
+        rows.push({
+          id: pointId,
+          deviceId,
+          stationId,
+          name: template.name,
+          standardMin: template.standardMin,
+          standardMax: template.standardMax,
+          unit: template.unit,
+          isCritical: template.isCritical,
+          createdAt: now,
+          updatedAt: now
+        })
+        versions.push({
+          id: standardVersionId(pointId, INITIAL_VERSION_DATE),
+          versionNo: 1,
+          pointId,
+          deviceId,
+          stationId,
+          effectiveDate: INITIAL_VERSION_DATE,
+          standardMin: template.standardMin,
+          standardMax: template.standardMax,
+          unit: template.unit,
+          isCritical: template.isCritical,
+          source: 'initial',
+          recalcBatchId: '',
+          note: '模板复制初始版本',
+          createdAt: now,
+          updatedAt: now,
+          revision: ROW_REVISION
+        })
+      })
+    if (rows.length > 0) {
+      await db.transaction('rw', [db.points, db.standardVersions], async () => {
+        await db.points.bulkPut(rows)
+        await db.standardVersions.bulkPut(versions)
+      })
+    }
     return rows.length
   },
 
@@ -233,44 +330,39 @@ export const useStationStore = create<StationState>((set, get) => ({
     set({ standardDraft: next })
   },
 
+  buildAdjustments() {
+    const state = get()
+    return Object.entries(state.standardDraft)
+      .map(([pointId, draft]) => {
+        const min = Math.min(draft.standardMin, draft.standardMax)
+        const maxInput = Math.max(draft.standardMin, draft.standardMax)
+        return {
+          pointId,
+          effectiveDate: state.adjustDate,
+          standardMin: min,
+          standardMax: maxInput > min ? maxInput : min + 0.001,
+          isCritical: draft.isCritical
+        }
+      })
+  },
+
   async commitStandardDraft(pointId) {
     const draft = get().standardDraft[pointId]
-    if (!draft) return
-    const min = Math.min(draft.standardMin, draft.standardMax)
-    const max = Math.max(draft.standardMin, draft.standardMax)
-    await db.points.update(pointId, {
-      standardMin: min,
-      standardMax: max > min ? max : min + 0.001,
-      isCritical: draft.isCritical,
-      updatedAt: Date.now()
-    })
+    if (!draft) return false
+    const [adjustment] = get().buildAdjustments().filter((item) => item.pointId === pointId)
+    if (!adjustment) return false
+    await submitStandardAdjustments([adjustment])
     get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
+    return true
   },
 
   async commitAllStandardDrafts() {
-    const entries = Object.entries(get().standardDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().standardDraft[point.id]
-        const min = Math.min(draft.standardMin, draft.standardMax)
-        const max = Math.max(draft.standardMin, draft.standardMax)
-        return {
-          ...point,
-          standardMin: min,
-          standardMax: max > min ? max : min + 0.001,
-          isCritical: draft.isCritical,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
+    const adjustments = get().buildAdjustments()
+    if (adjustments.length === 0) return 0
+    await submitStandardAdjustments(adjustments)
+    const count = adjustments.length
     get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
-    }
-    return rows.length
+    return count
   },
 
   devicesOfStation(stationId) {

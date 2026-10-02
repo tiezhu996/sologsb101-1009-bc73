@@ -231,7 +231,7 @@ export default function StationList() {
         <StatBadge label="调压站" value={stationStore.stations.length} suffix="座" tone="primary" />
         <StatBadge label="设备" value={stationStore.devices.length} suffix="台" tone="info" />
         <StatBadge label="巡检点位" value={stationStore.pointStats().total} suffix="个" tone="default" />
-        <StatBadge label="待处置泄漏" value={leakStore.counts()['待处置']} suffix="单" tone="danger" />
+        <StatBadge label="待处置/复核泄漏" value={leakStore.counts()['待处置'] + leakStore.reviewCount()} suffix="单" tone="danger" />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索站名 / 位置" onModelChange={onModelChange} />

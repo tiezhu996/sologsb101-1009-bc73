@@ -50,8 +50,11 @@ export function exportReadingCsv(
     '调压站',
     '设备',
     '点位',
-    '标准下限',
-    '标准上限',
+    '判定时标准下限',
+    '判定时标准上限',
+    '当前标准下限',
+    '当前标准上限',
+    '标准生效日期',
     '单位',
     '关键点',
     '计划日期',
@@ -61,6 +64,7 @@ export function exportReadingCsv(
     '读数',
     '偏差率(%)',
     '判定',
+    '重算批次',
     '备注'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -69,22 +73,28 @@ export function exportReadingCsv(
     const patrol = patrols.find((item) => item.id === reading.patrolId)
     const device = point ? devices.find((item) => item.id === point.deviceId) : undefined
     const station = patrol ? stations.find((item) => item.id === patrol.stationId) : undefined
+    const judgedCritical = reading.judgedCritical ?? point?.isCritical ?? false
+    const effectiveDate = reading.standardVersionId ? reading.standardVersionId.split(':')[1] ?? '' : ''
     lines.push(
       [
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
+        Number.isFinite(reading.judgedMin) ? reading.judgedMin : point ? point.standardMin : '—',
+        Number.isFinite(reading.judgedMax) ? reading.judgedMax : point ? point.standardMax : '—',
         point ? point.standardMin : '—',
         point ? point.standardMax : '—',
+        effectiveDate || (reading.judgedDate ? '初始版本' : '—'),
         point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        point ? (judgedCritical ? '是' : '否') : '—',
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        abnormalLevelOf(reading.deviationPct, judgedCritical),
+        reading.recalcBatchId || '—',
         reading.note || '—'
       ]
         .map(csvCell)

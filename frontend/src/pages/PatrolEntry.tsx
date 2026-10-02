@@ -27,6 +27,7 @@ import { usePatrolGap } from '@/hooks/usePatrolGap'
 import { PATROL_STATES, type Patrol, type PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
+import { abnormalLevelOf } from '@/utils/range'
 
 export default function PatrolEntry() {
   const stationStore = useStationStore()
@@ -151,11 +152,20 @@ export default function PatrolEntry() {
       render: (_value, record) => stationStore.points.find((point) => point.id === record.pointId)?.name ?? '点位已删除'
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '判定时标准',
+      width: 200,
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
-        return point ? `${point.standardMin} ~ ${point.standardMax} ${point.unit}` : '—'
+        const max = Number.isFinite(record.judgedMax) ? record.judgedMax : point?.standardMax
+        const min = Number.isFinite(record.judgedMin) ? record.judgedMin : point?.standardMin
+        return (
+          <div>
+            <span>
+              {min} ~ {max} {point ? point.unit : ''}
+            </span>
+            {record.judgedDate ? <div className="muted" style={{ fontSize: 12 }}>按 {record.judgedDate} 生效版本</div> : null}
+          </div>
+        )
       }
     },
     { title: '读数', dataIndex: 'value', width: 120, render: (value: number) => value },
@@ -166,7 +176,8 @@ export default function PatrolEntry() {
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
         if (!point) return <Tag>—</Tag>
-        return <AbnormalTag level={patrolStore.judge(point, record.value).level} size="small" />
+        // 已保存读数按存档时的版本快照还原当时判定
+        return <AbnormalTag level={abnormalLevelOf(record.deviationPct, record.judgedCritical ?? point.isCritical)} size="small" />
       }
     },
     { title: '备注', dataIndex: 'note', width: 200, render: (value: string) => value || '—' },
@@ -380,7 +391,7 @@ export default function PatrolEntry() {
                   data={activeReadings}
                   columns={readingColumns}
                   pagination={false}
-                  scroll={{ x: 1100 }}
+                  scroll={{ x: 1280 }}
                 />
               )}
             </>

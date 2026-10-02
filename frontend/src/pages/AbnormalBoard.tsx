@@ -78,8 +78,8 @@ export default function AbnormalBoard() {
       const foundTime = row.patrol
         ? row.patrol.patrolDate || row.patrol.planDate
         : new Date().toISOString().slice(0, 10)
-      if (leakStore.leaks.some((leak) => leak.deviceId === point.deviceId && leak.foundTime === foundTime)) {
-        Message.info('该设备当日已派发过处置单')
+      if (leakStore.hasLeakOfReading(row.reading.id)) {
+        Message.info('该读数已派发过泄漏处置单（按读数幂等，不重复派单）')
         return
       }
       const station = stationStore.stations.find((item) => item.id === point.stationId)
@@ -88,9 +88,10 @@ export default function AbnormalBoard() {
         stationId: point.stationId,
         concentrationPpm: row.reading.value,
         foundTime,
-        measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
+        measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，按 ${foundTime} 生效标准（${row.judgedMin}~${row.judgedMax}）判定偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
           station ? station.name : ''
-        } 已派发处置单`
+        } 已派发处置单`,
+        sourceReadingId: row.reading.id
       })
       Message.success('已派发泄漏处置单')
       return
@@ -105,17 +106,23 @@ export default function AbnormalBoard() {
       return
     }
     let leakCount = 0
+    let skippedDuplicate = 0
     let notedCount = 0
     for (const key of selectedKeys) {
       const row = rows.find((item) => item.reading.id === key)
       if (!row || !row.point) continue
       if (row.point.unit === 'ppm') {
+        if (leakStore.hasLeakOfReading(row.reading.id)) {
+          skippedDuplicate += 1
+          continue
+        }
         await leakStore.createFromAbnormal({
           deviceId: row.point.deviceId,
           stationId: row.point.stationId,
           concentrationPpm: row.reading.value,
           foundTime: row.patrol ? row.patrol.patrolDate || row.patrol.planDate : new Date().toISOString().slice(0, 10),
-          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`
+          measure: `${row.point.name} 实测 ${row.reading.value} ppm，按生效版本判定批量派单`,
+          sourceReadingId: row.reading.id
         })
         leakCount += 1
       } else {
@@ -123,7 +130,9 @@ export default function AbnormalBoard() {
         notedCount += 1
       }
     }
-    Message.success(`批量确认完成：派发处置单 ${leakCount} 张，记录确认 ${notedCount} 条`)
+    Message.success(
+      `批量确认完成：派发处置单 ${leakCount} 张${skippedDuplicate > 0 ? `，跳过重复 ${skippedDuplicate} 张` : ''}，记录确认 ${notedCount} 条`
+    )
     setSelectedKeys([])
   }
 
@@ -174,10 +183,27 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
-      render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+      title: '判定时标准（当时版本）',
+      width: 210,
+      render: (_value, record) => {
+        const unit = record.point?.unit ?? ''
+        return (
+          <div>
+            <span>
+              {record.judgedMin} ~ {record.judgedMax} {unit}
+            </span>
+            {record.standardVersionId ? (
+              <div className="muted" style={{ fontSize: 12 }}>
+                生效于 {record.standardVersionId.split(':')[1] ?? ''}
+              </div>
+            ) : (
+              <div className="muted" style={{ fontSize: 12 }}>
+                当前最新标准
+              </div>
+            )}
+          </div>
+        )
+      }
     },
     {
       title: '读数',
@@ -201,9 +227,9 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '巡检日期',
-      width: 120,
-      render: (_value, record) => record.patrol?.planDate ?? '—'
+      title: '巡检/判定日期',
+      width: 130,
+      render: (_value, record) => record.reading.judgedDate || record.patrol?.planDate || '—'
     },
     {
       title: '备注',
